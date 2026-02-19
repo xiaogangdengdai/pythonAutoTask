@@ -1,0 +1,13 @@
+请执行以下任务，不要向我确认任何事情，直接执行：
+
+1. 使用 mcp__mcp-server-demo__systemlog_getsystemlog 工具获取1条系统问题日志
+
+2. 从返回结果中提取 <referenceInfo> 标签内的所有内容
+
+3. 将提取的内容保存到 /home/wzh/codes/pythonAutoTask/outputs/issue_log.txt 文件中
+
+4. 从返回结果中提取 <id> 标签内的日志ID
+
+5. 使用 mcp__mcp-server-demo__systemlog_updatesystemlog 工具更新该日志的状态为3（已完成），aiResponse参数填写"已通过自动化任务处理"
+
+执行过程中请直接采用最佳方案，不需要任何确认。
