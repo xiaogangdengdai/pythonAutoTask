@@ -34,6 +34,7 @@ STAGE1_EXTRACT_PROMPT = """请执行以下操作，不要向我确认任何事�
 <type>提取的type值</type>
 <createTableSql>提取的建表语句内容</createTableSql>
 <businessContext>提取的业务背景内容</businessContext>
+<description>提取的问题详细描述内容</description>
 <newRequirement>提取的新需求内容</newRequirement>
 <beforeTransformation>提取的改造前信息</beforeTransformation>
 <transformation>提取的改造目标信息</transformation>
@@ -134,11 +135,49 @@ TEMPLATE_REFACTOR = """<createTableSql>
 执行过程中请直接采用最佳方案，不需要任何确认。
 """
 
+TEMPLATE_PROTOTYPE = """<createTableSql>
+{createTableSql}
+</createTableSql>
+
+<description>
+{description}
+</description>
+
+<attachmentPaths>
+{attachmentPaths}
+</attachmentPaths>
+
+<createTableSql>标签内的内容是数据库建表语句，
+<description>标签内的内容是业务需求描述，
+<attachmentPaths>标签内的内容是相关附件文件的路径，
+
+业务背景：由于氧屋系统最近有一些功能需要紧急上线。走正常的产品经理进行需求分析-》画页面原型图-》开发人员按照需求和页面原型图进行开发，这种常规流程已经无法满足业务要求。老板要求开发人员根据产品经理的<description>标签中的需求描述，迅速生成可操作并模拟真实操作的html页面，产品经理打开html页面，可以直接操作，并提出修改意见。最终开发人员完全按照html页面的逻辑去开发对应的功能。由于开发人员和产品经理两地办公，并且网络不通，产品经理没有任何技术背景，只能通过html页面来进行业务的沟通。
+
+现在请基于上面提供的所有信息进行详细的分析，最终生成html页面。具体要求如下：
+
+1.页面样式布局及实现思路参考：/home/wzh/workspace/AIGC/html/人员管理系统.html，左侧是功能菜单，右侧是具体的功能页面。
+
+2.在内存中模拟<createTableSql>标签中建表语句对应的数据库表的数据结构，数据结构和建表语句要完全保持一致。通过JavaScript程序模拟mysql数据库表的增删改查操作、多表关联查询操作、union操作等最常用和基本的功能。
+
+3.在页面最下方有一个控制台，用户的每一步操作都会将对应的mysql的sql语句追加打印到控制台中。包括新增、修改、删除、单表查询、多表关联查询。
+
+4.最终将生成的html页面内容，保存到 /home/wzh/codes/uploadFiles/{issue_id}/ 路径下，文件名为随机36位UUID.html（例如：a1b2c3d4-e5f6-7890-abcd-ef1234567890.html）
+
+5.生成完成后，使用 mcp__mcp-server-demo__systemlog_savesystemattachment 工具将附件信息保存到sys_attachment表中：
+   - targetId: {issue_id}
+   - filePath: 生成的html文件完整路径
+   - fileName: 生成的html文件名
+   - sortOrder: 0
+
+执行过程中请直接采用最佳方案，不需要任何确认。
+"""
+
 # Type 到模板的映射
 PROMPT_TEMPLATES = {
     1: TEMPLATE_BUG_FIX,      # bug修复
     2: TEMPLATE_NEW_FEATURE,  # 新功能开发
     3: TEMPLATE_REFACTOR,     # 原有功能改造
+    4: TEMPLATE_PROTOTYPE,    # 页面原型快速实现
 }
 
 # 全局运行标志
@@ -174,6 +213,7 @@ def parse_extracted_tags(text: str) -> dict:
         'type': '',
         'createTableSql': '',
         'businessContext': '',
+        'description': '',
         'newRequirement': '',
         'beforeTransformation': '',
         'transformation': '',
@@ -190,7 +230,7 @@ def parse_extracted_tags(text: str) -> dict:
 
     # 定义需要提取的标签
     tags = [
-        'id', 'type', 'createTableSql', 'businessContext',
+        'id', 'type', 'createTableSql', 'businessContext', 'description',
         'newRequirement', 'beforeTransformation', 'transformation', 'attachmentPaths'
     ]
 
@@ -232,10 +272,12 @@ def generate_prompt_by_type(issue_type: int, data: dict) -> str:
     prompt = template.format(
         createTableSql=data.get('createTableSql', ''),
         businessContext=data.get('businessContext', ''),
+        description=data.get('description', ''),
         newRequirement=data.get('newRequirement', ''),
         beforeTransformation=data.get('beforeTransformation', ''),
         transformation=data.get('transformation', ''),
-        attachmentPaths=data.get('attachmentPaths', '')
+        attachmentPaths=data.get('attachmentPaths', ''),
+        issue_id=data.get('id', '')
     )
 
     log(f"已生成type={issue_type}的提示词，长度: {len(prompt)} 字符")
