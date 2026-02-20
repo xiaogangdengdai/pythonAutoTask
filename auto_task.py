@@ -10,15 +10,29 @@ import os
 import re
 import time
 import signal
+import fcntl
+import sys
 from datetime import datetime
 from pathlib import Path
+import pymysql
 
 # 配置
 SCRIPT_DIR = Path(__file__).parent.resolve()
 OUTPUT_DIR = SCRIPT_DIR / "outputs"
 LOG_FILE = SCRIPT_DIR / "auto_task.log"
-CHECK_INTERVAL = 60  # 检测间隔（秒）
+LOCK_FILE = SCRIPT_DIR / "auto_task.lock"  # 单实例锁文件
+CHECK_INTERVAL = 300  # 检测间隔（秒），无数据时等待5分钟
 CLAUDE_TIMEOUT = 1800  # Claude执行超时时间（30分钟）
+
+# 数据库配置
+DB_CONFIG = {
+    'host': '192.168.2.246',
+    'port': 3306,
+    'user': 'root',
+    'password': 'root',
+    'database': 'oxi_ethetics',
+    'charset': 'utf8mb4'
+}
 
 # ============================================================
 # 第一阶段：提取日志信息的提示词模板
@@ -151,6 +165,9 @@ TEMPLATE_PROTOTYPE = """<createTableSql>
 <description>标签内的内容是业务需求描述，
 <attachmentPaths>标签内的内容是相关附件文件的路径，
 
+你是一个有着20多年开发经验的开发专家和业务分析专家以及数据库设计专家，
+必须首先认真读取: /home/wzh/workspace/CLAUDE.md 这个文件，这个文件是氧屋系统的整体业务和技术介绍。
+
 业务背景：由于氧屋系统最近有一些功能需要紧急上线。走正常的产品经理进行需求分析-》画页面原型图-》开发人员按照需求和页面原型图进行开发，这种常规流程已经无法满足业务要求。老板要求开发人员根据产品经理的<description>标签中的需求描述，迅速生成可操作并模拟真实操作的html页面，产品经理打开html页面，可以直接操作，并提出修改意见。最终开发人员完全按照html页面的逻辑去开发对应的功能。由于开发人员和产品经理两地办公，并且网络不通，产品经理没有任何技术背景，只能通过html页面来进行业务的沟通。
 
 现在请基于上面提供的所有信息进行详细的分析，最终生成html页面。具体要求如下：
@@ -172,22 +189,93 @@ TEMPLATE_PROTOTYPE = """<createTableSql>
 执行过程中请直接采用最佳方案，不需要任何确认。
 """
 
+TEMPLATE_JAVA_ANALYSIS = """<description>
+{description}
+</description>
+
+<attachmentPaths>
+{attachmentPaths}
+</attachmentPaths>
+
+<description>标签内的内容是业务需求描述，
+<attachmentPaths>标签内的内容是相关附件文件的路径，
+
+你是一个有着20多年开发经验的开发专家和业务分析专家以及数据库设计专家，帮我结合上面的背景信息，完成后台方法深度分析任务。
+必须首先认真读取: /home/wzh/workspace/CLAUDE.md 这个文件，这个文件是氧屋系统的整体业务和技术介绍。
+其他业务相关的资料位于: /home/wzh/workspace/AIGC/result 文件夹下，按需进行搜索。
+
+<description>标签中的java方法是氧屋系统最核心的功能，里面调用的函数非常多，而且调用层次非常深，请帮我完成以下任务：
+1.获取到该方法涉及到的所有类的完整内容，所有方法的完整内容，涉及到的所有数据库表结构，结合之前的业务背景分析这个方法的用途。
+2.生成该方法调用的时序图，让我一目了然了解该方法的调用链路。并且要在图中详细标注出调用方法时，被调用方法的具体作用，让我直观理解方法的作用。如果涉及到异步任务，那么异步任务中的方法链路也要分析，
+每个方法的入参和返回值都要有完整的示例数据作为支撑，示例数据的字段值要与java实体类的属性字段一致，以便我能直观的看清楚。附加开发新手都能听懂的方式，逐步讲解每一步流程在氧屋家装全统筹平台中的作用。
+3.生成该方法涉及到表的ER图
+4.生成该方法的业务流程图
+5.在业务角度，详细分析该方法的作用。
+6.一定要认真读取代码，根据真实代码生成内容，而不要自己创造。
+
+7.最终将生成的md格式的文件保存到 /home/wzh/codes/uploadFiles/{issue_id}/{{36位uuid}} 路径下，文件名为java方法分析.md，分多个文件进行输出，文件名后面追加序号即可。
+
+8.调用 mdToHtml 这个skill将/home/wzh/codes/uploadFiles/{issue_id}/{{36位uuid}} 路径下的所有md格式的文件，转换为一个html文件，保存到该路径下。
+
+9.生成完成后，使用 mcp__mcp-server-demo__systemlog_savesystemattachment 工具将附件信息保存到sys_attachment表中：
+   - targetId: {issue_id}
+   - filePath: 生成的html文件完整路径
+   - fileName: 生成的html文件名
+   - sortOrder: 0
+
+执行过程中请直接采用最佳方案，不需要任何确认。
+"""
+
 # Type 到模板的映射
 PROMPT_TEMPLATES = {
     1: TEMPLATE_BUG_FIX,      # bug修复
     2: TEMPLATE_NEW_FEATURE,  # 新功能开发
     3: TEMPLATE_REFACTOR,     # 原有功能改造
     4: TEMPLATE_PROTOTYPE,    # 页面原型快速实现
+    5: TEMPLATE_JAVA_ANALYSIS, # 后台方法深度分析
 }
 
 # 全局运行标志
 running = True
+lock_file = None  # 锁文件句柄
+
+def acquire_lock():
+    """
+    获取文件锁，确保同一时刻只有一个实例运行
+    Returns:
+        True: 获取锁成功，可以继续运行
+        False: 获取锁失败，已有其他实例在运行
+    """
+    global lock_file
+    try:
+        lock_file = open(LOCK_FILE, 'w')
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.write(f"{os.getpid()}\n")
+        lock_file.flush()
+        return True
+    except (IOError, OSError) as e:
+        if lock_file:
+            lock_file.close()
+            lock_file = None
+        return False
+
+def release_lock():
+    """释放文件锁"""
+    global lock_file
+    if lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+            lock_file = None
+        except Exception:
+            pass
 
 def signal_handler(signum, frame):
     """信号处理器，优雅退出"""
     global running
     log(f"收到信号 {signum}，准备退出...")
     running = False
+    release_lock()
 
 def log(message: str):
     """记录日志"""
@@ -316,11 +404,172 @@ def update_issue_status(issue_id: str, status: int, ai_response: str = "") -> bo
 
 def check_pending_issue() -> bool:
     """
-    使用MCP工具检测是否有待处理的问题日志
+    直接查询数据库检测是否有待处理的问题日志
     返回 True 表示有待处理的日志
     """
     log("检测是否有待处理的问题日志...")
 
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+
+        with conn.cursor() as cursor:
+            # status=1 表示待处理状态
+            cursor.execute("SELECT COUNT(*) FROM system_issue_log WHERE status = 1")
+            count = cursor.fetchone()[0]
+
+        conn.close()
+
+        if count > 0:
+            log(f"发现 {count} 条待处理的问题日志")
+            return True
+        else:
+            log("当前没有待处理的问题日志")
+            return False
+
+    except Exception as e:
+        log(f"数据库查询出错: {e}")
+        # 数据库出错时，回退到原来的 MCP 方式
+        log("回退到 MCP 方式检测...")
+        return check_pending_issue_via_mcp()
+
+
+def get_pending_issue_from_db() -> dict:
+    """
+    直接从数据库获取最早的1条待处理问题日志（包括附件）
+    返回包含日志数据和 XML 格式字符串的字典，如果没有数据返回 None
+    """
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+
+        with conn.cursor() as cursor:
+            # 查询最早的待处理日志
+            issue_sql = """SELECT id, type, create_table_sql, before_transformation,
+                                  transformation, business_context, status, new_requirement, description
+                           FROM system_issue_log
+                           WHERE status = 1
+                           ORDER BY created_at ASC
+                           LIMIT 1"""
+            cursor.execute(issue_sql)
+            row = cursor.fetchone()
+
+            if not row:
+                conn.close()
+                return None
+
+            # 获取列名
+            columns = [desc[0] for desc in cursor.description]
+            issue_data = dict(zip(columns, row))
+            issue_id = issue_data['id']
+
+            # 查询关联的附件
+            attachment_sql = """SELECT file_path FROM sys_attachment
+                                WHERE target_id = %s AND type = 1
+                                ORDER BY sort_order ASC"""
+            cursor.execute(attachment_sql, (issue_id,))
+            attachment_paths = [row[0] for row in cursor.fetchall()]
+
+        conn.close()
+
+        # 构建 XML 格式（与 MCP 工具的格式一致）
+        xml_content = build_result_xml(issue_data, attachment_paths)
+
+        log(f"从数据库获取到问题日志: id={issue_id[:20]}..., type={issue_data['type']}")
+
+        return {
+            'data': issue_data,
+            'xml': xml_content,
+            'attachment_paths': attachment_paths
+        }
+
+    except Exception as e:
+        log(f"数据库查询出错: {e}")
+        return None
+
+
+def build_result_xml(issue_data: dict, attachment_paths: list) -> str:
+    """
+    构建 XML 格式的返回结果（与 MCP 工具格式一致）
+    """
+    def null_to_empty(value):
+        return "" if value is None else str(value)
+
+    lines = ["<referenceInfo>"]
+    lines.append("    <id>")
+    lines.append(f"    {null_to_empty(issue_data.get('id'))}")
+    lines.append("    </id>")
+
+    lines.append("    <type>")
+    lines.append(f"    {null_to_empty(issue_data.get('type'))}")
+    lines.append("    </type>")
+
+    lines.append("    <createTableSql>")
+    lines.append(f"    {null_to_empty(issue_data.get('create_table_sql'))}")
+    lines.append("    </createTableSql>")
+
+    lines.append("    <newRequirement>")
+    lines.append(f"    {null_to_empty(issue_data.get('new_requirement'))}")
+    lines.append("    </newRequirement>")
+
+    lines.append("    <beforeTransformation>")
+    lines.append(f"    {null_to_empty(issue_data.get('before_transformation'))}")
+    lines.append("    </beforeTransformation>")
+
+    lines.append("    <transformation>")
+    lines.append(f"    {null_to_empty(issue_data.get('transformation'))}")
+    lines.append("    </transformation>")
+
+    lines.append("    <businessContext>")
+    lines.append(f"    {null_to_empty(issue_data.get('business_context'))}")
+    lines.append("    </businessContext>")
+
+    lines.append("    <description>")
+    lines.append(f"    {null_to_empty(issue_data.get('description'))}")
+    lines.append("    </description>")
+
+    lines.append("    <status>")
+    lines.append(f"    {null_to_empty(issue_data.get('status'))}")
+    lines.append("    </status>")
+
+    lines.append("    <attachmentPaths>")
+    for path in attachment_paths:
+        lines.append("     <attachmentPath>")
+        lines.append(f"     {null_to_empty(path)}")
+        lines.append("     </attachmentPath>")
+    lines.append("    </attachmentPaths>")
+
+    lines.append("</referenceInfo>")
+
+    return "\n".join(lines)
+
+
+def convert_db_data_to_dict(db_result: dict) -> dict:
+    """
+    将数据库返回的数据转换为与 parse_extracted_tags 兼容的格式
+    """
+    issue_data = db_result['data']
+    attachment_paths = db_result['attachment_paths']
+
+    # 将附件路径列表转换为字符串
+    attachment_paths_str = "\n".join(attachment_paths) if attachment_paths else ""
+
+    return {
+        'id': issue_data.get('id', ''),
+        'type': issue_data.get('type', 0),
+        'createTableSql': issue_data.get('create_table_sql', '') or '',
+        'businessContext': issue_data.get('business_context', '') or '',
+        'description': issue_data.get('description', '') or '',
+        'newRequirement': issue_data.get('new_requirement', '') or '',
+        'beforeTransformation': issue_data.get('before_transformation', '') or '',
+        'transformation': issue_data.get('transformation', '') or '',
+        'attachmentPaths': attachment_paths_str
+    }
+
+
+def check_pending_issue_via_mcp() -> bool:
+    """
+    通过 MCP 工具检测是否有待处理的问题日志（备用方案）
+    返回 True 表示有待处理的日志
+    """
     # 通过调用 Claude 快速检测（使用简化的prompt）
     check_prompt = """
 请只执行这一个操作，不要做其他任何事情：
@@ -398,32 +647,50 @@ def process_one_issue():
     """处理一条问题日志（两阶段模式）"""
     try:
         # ============================================================
-        # 第一阶段：获取日志信息
+        # 第一阶段：获取日志信息（优先使用数据库，失败则回退到 MCP）
         # ============================================================
         log("=" * 40)
         log("第一阶段：获取日志信息")
         log("=" * 40)
 
-        return_code, stdout, stderr = run_claude_with_prompt(STAGE1_EXTRACT_PROMPT)
-
-        if return_code != 0:
-            log(f"第一阶段执行失败，返回码: {return_code}")
-            if stderr:
-                log(f"错误输出: {stderr}")
-            return
-
-        # 保存第一阶段输出
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        stage1_file = OUTPUT_DIR / f"stage1_{timestamp}.txt"
-        with open(stage1_file, "w", encoding="utf-8") as f:
-            f.write(stdout)
-        log(f"第一阶段输出已保存到: {stage1_file}")
+        data = None
 
-        # 解析提取的数据
-        data = parse_extracted_tags(stdout)
+        # 优先尝试从数据库获取
+        db_result = get_pending_issue_from_db()
+        if db_result:
+            log("从数据库获取日志成功")
+            # 保存数据库返回的 XML
+            stage1_file = OUTPUT_DIR / f"stage1_{timestamp}.txt"
+            with open(stage1_file, "w", encoding="utf-8") as f:
+                f.write(db_result['xml'])
+            log(f"第一阶段输出已保存到: {stage1_file}")
 
-        if not data['id']:
-            log("未能提取日志ID，跳过处理")
+            # 将数据库返回的数据转换为 parse_extracted_tags 兼容的格式
+            data = convert_db_data_to_dict(db_result)
+        else:
+            # 数据库获取失败，回退到 MCP 方式
+            log("数据库获取失败，回退到 MCP 方式获取日志...")
+
+            return_code, stdout, stderr = run_claude_with_prompt(STAGE1_EXTRACT_PROMPT)
+
+            if return_code != 0:
+                log(f"第一阶段执行失败，返回码: {return_code}")
+                if stderr:
+                    log(f"错误输出: {stderr}")
+                return
+
+            # 保存第一阶段输出
+            stage1_file = OUTPUT_DIR / f"stage1_{timestamp}.txt"
+            with open(stage1_file, "w", encoding="utf-8") as f:
+                f.write(stdout)
+            log(f"第一阶段输出已保存到: {stage1_file}")
+
+            # 解析提取的数据
+            data = parse_extracted_tags(stdout)
+
+        if not data or not data.get('id'):
+            log("未能获取日志数据，跳过处理")
             return
 
         # ============================================================
@@ -476,6 +743,12 @@ def process_one_issue():
 
 def main():
     """主函数 - 轮询模式"""
+    # 检查是否已有实例在运行
+    if not acquire_lock():
+        print("错误：已有另一个 auto_task.py 实例在运行，同一时刻只能运行一个实例", flush=True)
+        log("启动失败：已有另一个实例在运行")
+        return 1
+
     # 注册信号处理器
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
@@ -526,6 +799,8 @@ def main():
         import traceback
         log(traceback.format_exc())
         return 1
+    finally:
+        release_lock()
 
     log("自动化任务执行器退出")
     return 0
